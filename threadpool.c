@@ -1,18 +1,21 @@
 
 #include "threadpool.h"
 
-#include <stdio.h>
 #include <assert.h>
 
 #define FOREVER  -1
-//#define FOREVER   ((unsigned long)~((unsigned long)0))
+
 #define threadpool_malloc(l) malloc(l)
 #define threadpool_realooc(p, l) realloc(p, l)
 #define threadpool_free(p) free(p)
+typedef long long       _time_t;
+
+#define threadpool_wait_cond(pool, cv, tival) threadpool_wait_cond_((pool), &(cv), (tival))
 
 #ifdef _WIN32
 #include <process.h>
 #include <Windows.h>
+#define EWAITTIMEOUT  ERROR_TIMEOUT
 
 typedef HANDLE                   _thread_t;
 typedef CONDITION_VARIABLE       _thread_cond_t;
@@ -30,9 +33,9 @@ typedef CRITICAL_SECTION         _thread_mutex_t;
 #include <stdlib.h>
 #include <pthread.h>
 #include <errno.h>
-
+#include <sys/time.h>
 #define max(a,b)    (((a) > (b)) ? (a) : (b))
-#define ERROR_TIMEOUT  ETIMEDOUT
+#define EWAITTIMEOUT  ETIMEDOUT
 
 typedef pthread_t                   _thread_t;
 typedef pthread_cond_t       _thread_cond_t;
@@ -49,15 +52,9 @@ typedef pthread_mutex_t         _thread_mutex_t;
 #endif
 
 
-
-
-typedef unsigned long thread_ulong_t;
-typedef int thread_bool_t;
-
-
 typedef struct __HEAPELEMENT
 {
-    time_t dwValue;
+    _time_t tiValue;
     thread_ulong_t * pdwIndex;
     void * pObject;
 }HEAPELEMENT;
@@ -75,6 +72,7 @@ typedef struct __JOB
     queue_hook_cb callback;//回调
     void * obj;//参数一，可以作为C++ this指针
     void * arg;//参数二，可以作为C++ class成员函数参数
+    thread_ulong_t index;//内存索引标记
     struct __JOB * next;
 }JOB, *PJOB;
 
@@ -90,7 +88,7 @@ typedef struct __POOLTIMER
     //为无信号, 定时器执行完毕后,设置为有信号
     //void * signal;
     _thread_cond_t cv_kill;
-    time_t timeout;//毫秒
+    _time_t timeout;//毫秒
     timer_hook_cb callback;
     long event;
     void * arg;
@@ -102,7 +100,6 @@ struct __THREADPOOL{
     int thread_cur_num;//当前线程数
     int queue_cur_num;//当前队列消息数
     int queue_max_num;//最大队列消息数
-    thread_bool_t thread_work;//线程是否继续工作
     thread_bool_t pool_close;//正在关闭线程池
     _thread_t * pthreads;//线程句柄数组
     thread_bool_t block_full;//默认TRUE 队列满时,阻塞等待. FALSE 失败退出
@@ -124,6 +121,7 @@ struct __THREADPOOL{
     MINHEAP * time_heap;//timer小根堆
 
 #define MAX_TIMER_COUNT   16
+#define TIMER_ARRAY_COUNT  (MAX_TIMER_COUNT/2)
     POOLTIMER thread_timer[MAX_TIMER_COUNT];//最多定义N个timer
     int timer_count;//定时器数量
     queue_hook_cb stable_cb;//固定的回调,保留
@@ -137,9 +135,9 @@ static void empty(void * p, int size)
     }
 }
 
-static time_t get_time()
+static _time_t get_time()
 {
-    time_t ti = 0;
+    _time_t ti = 0;
 #ifdef _WIN32
 
     QueryPerformanceCounter((LARGE_INTEGER*)&ti);
@@ -153,7 +151,6 @@ static time_t get_time()
     ti += tival.tv_sec * 1000;
     ti += tival.tv_usec / 1000;
 #endif
-
     return ti;
 }
 
@@ -162,8 +159,8 @@ static time_t get_time()
 下面是timer
 */
 
-#define SET_ELEM_INDEX(pElem, Value)  ((pElem)->pdwIndex ? *(pElem)->pdwIndex = Value : 0)
-#define UPDATE_ELEM_INDEX(lpElemArray, Index)  ((lpElemArray)[Index].pdwIndex ? *(lpElemArray)[Index].pdwIndex = (Index) : 0)
+#define MHELEM_SET_INDEX(pElem, Value)  ((pElem)->pdwIndex ? *(pElem)->pdwIndex = Value : 0)
+#define MHELEM_UPDATE_INDEX(lpElemArray, Index)  ((lpElemArray)[Index].pdwIndex ? *(lpElemArray)[Index].pdwIndex = (Index) : 0)
 
 static MINHEAP * min_heap_new_(thread_ulong_t dwIncrement)
 {
@@ -266,16 +263,16 @@ static thread_bool_t min_heap_push_(MINHEAP * pMinHeap, const HEAPELEMENT * pEle
     while (0 != nIndex)
     {
         j = (nIndex - 1) / 2; //j指向下标为nIndex的元素的双亲
-        if (pElem->dwValue >= lpArray[j].dwValue) //若新元素大于待调整元素的双亲，则比较调整结束，退出循环
+        if (pElem->tiValue >= lpArray[j].tiValue) //若新元素大于待调整元素的双亲，则比较调整结束，退出循环
             break;
 
         lpArray[nIndex] = lpArray[j]; //将双亲元素下移到待调整元素的位置
 
-        UPDATE_ELEM_INDEX(lpArray, nIndex);
+        MHELEM_UPDATE_INDEX(lpArray, nIndex);
         nIndex = j; //使待调整位置变为其双亲位置，进行下一次循环
     }
     lpArray[nIndex] = *pElem;//把新元素调整到最终位置
-    UPDATE_ELEM_INDEX(lpArray, nIndex);
+    MHELEM_UPDATE_INDEX(lpArray, nIndex);
 
     return TRUE;
 }
@@ -298,7 +295,7 @@ static thread_bool_t min_heap_erase_(MINHEAP * pMinHeap, thread_ulong_t uIndex)
     if (uIndex > pMinHeap->dwCount) return FALSE;
 
     lpArray = pMinHeap->lpArrayElement;
-    SET_ELEM_INDEX(&lpArray[uIndex], -1);//已经被移除
+    MHELEM_SET_INDEX(&lpArray[uIndex], -1);//已经被移除
 
     if (0 == --pMinHeap->dwCount) return TRUE;
 
@@ -308,20 +305,20 @@ static thread_bool_t min_heap_erase_(MINHEAP * pMinHeap, thread_ulong_t uIndex)
     while (pMinHeap->dwCount - 1 >= j)//寻找待调整元素的最终位置，每次使孩子元素上移一层，调整到孩子为空时止
     {
         //若存在右孩子且较小，使j指向右孩子
-        if (pMinHeap->dwCount - 1 > j && lpArray[j].dwValue > lpArray[j + 1].dwValue)//左比右大
+        if (pMinHeap->dwCount - 1 > j && lpArray[j].tiValue > lpArray[j + 1].tiValue)//左比右大
             j++;//指向右边, 指向小的位置
 
-        if (lpArray[j].dwValue >= Element.dwValue) //若temp比其较小的孩子还小，则调整结束，退出循环
+        if (lpArray[j].tiValue >= Element.tiValue) //若temp比其较小的孩子还小，则调整结束，退出循环
             break;
 
         lpArray[uIndex] = lpArray[j];//否则，将孩子元素移到双亲位置
-        UPDATE_ELEM_INDEX(lpArray, uIndex);
+        MHELEM_UPDATE_INDEX(lpArray, uIndex);
         uIndex = j; //将待调整位置变为其较小的孩子位置
         j = 2 * uIndex + 1;//将j变为新的待调整位置的左孩子位置，继续下一次循环
     }
 
     lpArray[uIndex] = Element;
-    UPDATE_ELEM_INDEX(lpArray, uIndex);
+    MHELEM_UPDATE_INDEX(lpArray, uIndex);
 
     if (pMinHeap->dwCount >= pMinHeap->dwIncrement && 0 == pMinHeap->dwCount % pMinHeap->dwIncrement)
     {
@@ -347,7 +344,7 @@ static thread_bool_t min_heap_pop_(MINHEAP * pMinHeap, HEAPELEMENT * pElem)
     return FALSE;
 }
 
-static int min_heap_popbat_(MINHEAP * pMinHeap, thread_ulong_t dwCutValue, HEAPELEMENT * pElem, int nCount)
+static int min_heap_popbat_(MINHEAP * pMinHeap, _time_t tiCutValue, HEAPELEMENT * pElem, int nCount)
 {
     int nIndex = 0;
     if (NULL == pMinHeap || NULL == pElem)
@@ -361,7 +358,7 @@ static int min_heap_popbat_(MINHEAP * pMinHeap, thread_ulong_t dwCutValue, HEAPE
     //将符合触发条件的event都取出来
     for (nIndex = 0; nCount > nIndex; nIndex++)
     {
-        if (pMinHeap->dwCount > 0 && dwCutValue >= pMinHeap->lpArrayElement[0].dwValue)
+        if (pMinHeap->dwCount > 0 && tiCutValue >= pMinHeap->lpArrayElement[0].tiValue)
         {
             min_heap_pop_(pMinHeap, &pElem[nIndex]);
         }
@@ -403,7 +400,7 @@ static int threadpool_reset_timer_nolock(THREADPOOL pool, POOLTIMER * timer)
         return 0;
     }
 
-    element.dwValue += timer->timeout + get_time();
+    element.tiValue = timer->timeout + get_time();
     element.pObject = timer;
     element.pdwIndex = &timer->index;
 
@@ -418,13 +415,13 @@ static int threadpool_reset_timer_nolock(THREADPOOL pool, POOLTIMER * timer)
     return ret;
 }
 
-static int threadpool_get_timer_nolock(THREADPOOL pool, HEAPELEMENT * timer_array, time_t ti_cache, thread_ulong_t threadid)
+static int threadpool_get_timer_nolock(THREADPOOL pool, HEAPELEMENT * timer_array, _time_t ti_cache, thread_ulong_t threadid)
 {
     int count = 0;
     POOLTIMER * timer = NULL;
     int i = 0;
-    empty(timer_array, sizeof(HEAPELEMENT) * MAX_TIMER_COUNT);
-    count = min_heap_popbat_(pool->time_heap, ti_cache, timer_array, MAX_TIMER_COUNT);
+    empty(timer_array, sizeof(HEAPELEMENT) * TIMER_ARRAY_COUNT);
+    count = min_heap_popbat_(pool->time_heap, ti_cache, timer_array, TIMER_ARRAY_COUNT);
 
     //设置当前调用线程
     for (i = 0; count > i; i++)
@@ -455,9 +452,11 @@ static void threadpool_free_job_nolock(THREADPOOL pool, JOB * job)
     pool->cache_frist = job;
 }
 
-static thread_ulong_t threadpool_wait_cond(THREADPOOL pool, _thread_cond_t * cond_t, thread_ulong_t tvwait)
+static thread_ulong_t threadpool_wait_cond_(THREADPOOL pool, _thread_cond_t * cond_t, thread_ulong_t tvwait)
 {
     thread_ulong_t error = 0;
+
+    if (0 == tvwait) return EWAITTIMEOUT;
 #ifdef _WIN32
 
     if (FALSE == SleepConditionVariableCS(cond_t, &(pool)->lock, (tvwait)))
@@ -468,9 +467,29 @@ static thread_ulong_t threadpool_wait_cond(THREADPOOL pool, _thread_cond_t * con
 #else
 
     struct timespec abstime = { 0 };
-    abstime.tv_nsec = ((long)((tvwait) % 1000) * 1000000);
-    abstime.tv_sec = ((time_t)(time(NULL) + (tvwait) / 1000));
-    error =  pthread_cond_timedwait(cond_t, &pool->lock, &abstime);
+    struct timeval tival = { 0 };
+
+    if (FOREVER == tvwait)
+    {
+        error = pthread_cond_wait(cond_t, &pool->lock);
+    }
+    else
+    {
+        gettimeofday(&tival, NULL);
+        abstime.tv_sec = tival.tv_sec + (tvwait) / 1000;
+        if(0 == abstime.tv_sec)
+        {
+            //pthread_cond_timedwait至少需要休眠一秒, 否则返回EINVAL
+            abstime.tv_sec = 1;
+            abstime.tv_nsec = 0;
+        }
+        else
+        {
+            abstime.tv_nsec = (tival.tv_usec + (tvwait) % 1000) * 1000000;
+        }
+        
+        error = pthread_cond_timedwait(cond_t, &pool->lock, &abstime);
+    }
 
 #endif
     return error;
@@ -486,13 +505,13 @@ static void * TPSTDCALL threadpool_worker(void * arg)
 
     JOB * job = NULL;
     POOLTIMER * timer = NULL;
-    HEAPELEMENT * timer_array = (HEAPELEMENT*)threadpool_malloc(sizeof(HEAPELEMENT) * MAX_TIMER_COUNT);
-    assert(timer_array && "threadpool_function 致命的内存分配错误!");
+    HEAPELEMENT * timer_array = (HEAPELEMENT*)threadpool_malloc(sizeof(HEAPELEMENT) * TIMER_ARRAY_COUNT);
+    assert(timer_array && "threadpool_worker 致命的内存分配错误!");
 
     int timer_count = 0;//触发的timer个数
 
     HEAPELEMENT element = { 0 };
-    time_t ti_cache = 0;
+    _time_t ti_cache = 0;
     thread_ulong_t timeout = FOREVER;
     thread_ulong_t last_error = 0;
     int handle_count = 0;//任务累计
@@ -503,12 +522,12 @@ static void * TPSTDCALL threadpool_worker(void * arg)
     threadpool_lock(pool);
     if (pool->thread_num)
     {
-        is_permanent_thread = pool->thread_num > pool->thread_cur_num ? TRUE : FALSE;
+        is_permanent_thread = pool->thread_num >= pool->thread_cur_num ? TRUE : FALSE;
         threadpool_wake_one(pool->cv_create_thread);
     }
     threadpool_unlock(pool);
 
-    while (pool->thread_work)
+    while (TRUE)
     {
     BEGIN:
         timeout = FOREVER;
@@ -518,13 +537,14 @@ static void * TPSTDCALL threadpool_worker(void * arg)
         //通过iotime.key.data是否为NULL, 来得知上一个定时器是否被处理
         //被处理的话就提取一个新的
 
-        if (pool->timer_count && handle_count > pool->thread_cur_num && pool->queue_cur_num)
+        if (pool->timer_count && handle_count > pool->thread_cur_num 
+            && pool->queue_cur_num && FALSE == pool->pool_close)
         {
             //定时器优先级很低，当任务很多的时候我们每处理大于线程数或以上的任务才行检查一次定时器
             if (TRUE == min_heap_top_(pool->time_heap, &element))
             {
                 ti_cache = get_time();
-                if (ti_cache >= element.dwValue)//时间到
+                if (ti_cache >= element.tiValue)//时间到
                 {
                     if (timer_count = threadpool_get_timer_nolock(pool, timer_array, ti_cache, threadid))
                     {
@@ -536,29 +556,22 @@ static void * TPSTDCALL threadpool_worker(void * arg)
 
         while (0 == pool->queue_cur_num)
         {
-            if (FALSE == is_permanent_thread || FALSE == pool->thread_work)
+            if (FALSE == is_permanent_thread || TRUE == pool->pool_close)
             {
                 pool->thread_cur_num--;
                 threadpool_unlock(pool);
                 goto BYEBYE;
             }
-            else if (TRUE == min_heap_top_(pool->time_heap, &element))
+
+            if (TRUE == min_heap_top_(pool->time_heap, &element))
             {
                 ti_cache = get_time();
-                timeout = (thread_ulong_t)max(0, element.dwValue - ti_cache);
-
-                if (0 == timeout)//时间到
-                {
-                    if (timer_count = threadpool_get_timer_nolock(pool, timer_array, ti_cache, threadid))
-                    {
-                        goto FINISH;
-                    }
-                }
+                timeout = (thread_ulong_t)(element.tiValue > ti_cache ? element.tiValue - ti_cache : 0);
             }
 
-            if (last_error = threadpool_wait_cond(pool, &pool->cv_not_empty, timeout))
+            if (last_error = threadpool_wait_cond(pool, pool->cv_not_empty, timeout))
             {
-                if (ERROR_TIMEOUT == last_error)
+                if (EWAITTIMEOUT == last_error)
                 {
                     ti_cache = get_time();
                     if (timer_count = threadpool_get_timer_nolock(pool, timer_array, ti_cache, threadid))
@@ -567,7 +580,7 @@ static void * TPSTDCALL threadpool_worker(void * arg)
                     }
                 }
                 threadpool_unlock(pool);
-                fprintf(stderr, "threadpool_function unkown last error = %d ERROR_TIMEOUT = %d\n", last_error, ERROR_TIMEOUT);
+
                 goto BEGIN;
             }
         }
@@ -591,7 +604,6 @@ static void * TPSTDCALL threadpool_worker(void * arg)
             //任务都执行完了， 再退出
             if (TRUE == pool->pool_close)
             {
-                pool->thread_work = FALSE;
                 threadpool_wake_one(pool->cv_not_empty);
             }
         }
@@ -643,7 +655,7 @@ static void * TPSTDCALL threadpool_worker(void * arg)
             threadpool_free_job_nolock(pool, job);
             threadpool_unlock(pool);
         }
-    }/*while(pool->thread_work)*/
+    }/*while(TRUE)*/
 
 BYEBYE:
     threadpool_free(timer_array);
@@ -685,7 +697,6 @@ THREADPOOL threadpool_create(unsigned int thread_num, unsigned int max_thread_nu
     pool->queue_max_num = queue_max_num;
     pool->queue_frist = NULL;
     pool->queue_last = NULL;
-    pool->thread_work = TRUE;
     pool->pool_close = FALSE;
     pool->block_full = TRUE;
 
@@ -723,6 +734,7 @@ THREADPOOL threadpool_create(unsigned int thread_num, unsigned int max_thread_nu
     pool->cache_frist = pool->job_mempool;
     for (i = 0; queue_count > i; i++)
     {
+        pool->job_mempool[i].index = i;
         pool->job_mempool[i].next = &pool->job_mempool[i + 1];
     }
 
@@ -744,12 +756,13 @@ THREADPOOL threadpool_create(unsigned int thread_num, unsigned int max_thread_nu
 
             pool->pthreads[i] = (_thread_t)_beginthreadex(NULL, 0, threadpool_worker, (LPVOID)pool, 0, 0);
 
-            if (INVALID_HANDLE_VALUE != pool->pthreads[i])
+            if (INVALID_HANDLE_VALUE == pool->pthreads[i])
             {
-                pool->thread_cur_num++;
-                threadpool_wait_cond(pool, &pool->cv_create_thread, FOREVER);
+                goto FAILED;
             }
 
+            pool->thread_cur_num++;
+            threadpool_wait_cond(pool, pool->cv_create_thread, FOREVER);
             threadpool_unlock(pool);
         }
     }
@@ -770,7 +783,11 @@ THREADPOOL threadpool_create(unsigned int thread_num, unsigned int max_thread_nu
             if (0 == pthread_create(&pool->pthreads[i], NULL, threadpool_worker, (void *)pool))
             {
                 pool->thread_cur_num++;
-                threadpool_wait_cond(pool, &pool->cv_create_thread, FOREVER);
+                threadpool_wait_cond(pool, pool->cv_create_thread, FOREVER);
+            }
+            else
+            {
+                goto FAILED;
             }
 
             threadpool_unlock(pool);
@@ -781,6 +798,10 @@ THREADPOOL threadpool_create(unsigned int thread_num, unsigned int max_thread_nu
 
     //用自旋锁等待线程创建完成, 其实很快的
     return pool;
+
+FAILED:
+    threadpool_destroy(pool);
+    return NULL;
 }
 
 thread_bool_t threadpool_destroy(THREADPOOL pool)
@@ -793,12 +814,13 @@ thread_bool_t threadpool_destroy(THREADPOOL pool)
         return FALSE;
     }
 
-    //if (pool->time_heap) time_heap_clear(pool->time_heap);
     pool->pool_close = TRUE;
+
+    threadpool_wake_one(pool->cv_not_empty);
 
     while (pool->thread_cur_num)
     {
-        threadpool_wait_cond(pool, &pool->cv_destroy, FOREVER);
+        threadpool_wait_cond(pool, pool->cv_destroy, FOREVER);
     }
 
     threadpool_unlock(pool);
@@ -807,7 +829,7 @@ thread_bool_t threadpool_destroy(THREADPOOL pool)
     if (pool->thread_num)
     {
         //WaitForMultipleObjects(pool->thread_num, pool->pthreads, TRUE, FROEVER);
-        for (int i = 0; pool->thread_num > i; i++)
+        for (int i = 0; pool->pthreads && pool->thread_num > i; i++)
         {
             CloseHandle(pool->pthreads[i]);
         }
@@ -846,9 +868,7 @@ int threadpool_add_job(THREADPOOL pool, thread_bool_t priority, queue_hook_cb ca
 
     while (FALSE == pool->pool_close && pool->queue_cur_num == pool->queue_max_num)
     {
-        //fprintf(stderr, "threadpool_add_job 任务数量达到峰顶[%d], 进入等待模式", pool->queue_max_num);
-        threadpool_wait_cond(pool, &pool->cv_not_full, FOREVER);
-        //fprintf(stderr, "threadpool_add_job 等待被唤醒, 当前任务数[%d]", pool->queue_cur_num);
+        threadpool_wait_cond(pool, pool->cv_not_full, FOREVER);
     }
 
     if (TRUE == pool->pool_close)
@@ -921,7 +941,7 @@ int threadpool_add_job(THREADPOOL pool, thread_bool_t priority, queue_hook_cb ca
         {
             pool->thread_cur_num++;
             CloseHandle(tid);
-            threadpool_wait_cond(pool, &pool->cv_destroy, FOREVER);
+            threadpool_wait_cond(pool, pool->cv_create_thread, FOREVER);
         }
 
 #else
@@ -929,7 +949,7 @@ int threadpool_add_job(THREADPOOL pool, thread_bool_t priority, queue_hook_cb ca
         if (0 == pthread_create(&tid, NULL, threadpool_worker, (void *)pool))
         {
             pool->thread_cur_num++;
-            threadpool_wait_cond(pool, &pool->cv_destroy, FOREVER);
+            threadpool_wait_cond(pool, pool->cv_create_thread, FOREVER);
         }
 #endif
     }
@@ -958,12 +978,19 @@ thread_bool_t threadpool_active(THREADPOOL pool)
     return FALSE;
 }
 
-THREADTIMER threadpool_set_timer(THREADPOOL pool, time_t timeout, timer_hook_cb callback, void * arg, long event)
+THREADTIMER threadpool_set_timer(THREADPOOL pool, thread_ulong_t timeout, timer_hook_cb callback, void * arg, long event)
 {
     POOLTIMER * timer = NULL;
     _thread_cond_t cv_kill = { 0 };
     int tid = 0;
     int i = 0;
+
+    if (FOREVER == timeout)
+    {
+        assert(0 && "threadpool_set_timer 禁止设置用不超时的定时器");
+        return tid;
+    }
+
     threadpool_lock(pool);
 
     //因为线程池是不会频繁地增删定时器的,所以这里用for循环,不需要太高效的算法
@@ -1016,7 +1043,7 @@ thread_bool_t threadpool_kill_timer(THREADPOOL pool, THREADTIMER tid)
             //timer回调线程中删除定时器,那么用户应该知道如何保证线程安全
             //直接删除就可以了, 如果非当前线程, 那么要等timer回调结束,
             //才能删除定时器
-            threadpool_wait_cond(pool, &timer->cv_kill, FOREVER);
+            threadpool_wait_cond(pool, timer->cv_kill, FOREVER);
         }
 
         min_heap_erase_(pool->time_heap, timer->index);
@@ -1045,7 +1072,6 @@ HQUEUE queue_create(unsigned int max_message)
 
 unsigned int queue_dispatch(HQUEUE queue)
 {
-    ((THREADPOOL)queue)->thread_work = TRUE;
     unsigned int ret = (unsigned int)threadpool_worker((void*)queue);
     return ret;
 }
@@ -1057,7 +1083,7 @@ int queue_post(HQUEUE queue, queue_hook_cb callback, void * obj, void *arg)
 
 thread_bool_t queue_break(HQUEUE queue)
 {
-    ((THREADPOOL)queue)->thread_work = FALSE;
+    ((THREADPOOL)queue)->pool_close = TRUE;
     return TRUE;
 }
 
@@ -1066,7 +1092,7 @@ thread_bool_t queue_destroy(HQUEUE queue)
     return threadpool_destroy((THREADPOOL)queue);
 }
 
-HQTIMER queue_set_timer(HQUEUE queue, time_t timeout, timer_hook_cb callback, void * arg, long event)
+HQTIMER queue_set_timer(HQUEUE queue, thread_ulong_t timeout, timer_hook_cb callback, void * arg, long event)
 {
     return (HQTIMER)threadpool_set_timer((THREADPOOL)queue, timeout, callback, arg, event);
 }

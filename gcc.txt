@@ -1,1 +1,2 @@
-gcc -o main threadpool.c demo.cpp -lpthread
+gcc -o demo threadpool.c demo.cpp -lpthread
+gcc -g -o demo threadpool.c demo.cpp -lpthread

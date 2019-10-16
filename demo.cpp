@@ -8,6 +8,7 @@
 #include <Windows.h>
 #else
 #include <time.h>
+#include <pthread.h>
 #endif
 //#pragma warning (disable:4700);
 #define __THREAD_POOL_DEMO__
@@ -26,16 +27,14 @@ HQUEUE queue = NULL;
 
 int demo(int argc, char **argv)
 {
-
-
-
+    HQTIMER timerid = NULL;
 #if 1
     pool = threadpool_create(2, 4, 2000);
 
-    HQTIMER timerid = threadpool_set_timer(pool, 1000, timer_cb, 0, 0);
+    timerid = threadpool_set_timer(pool, 1000, timer_cb, 0, 0);
 
 #ifdef _WIN32
-    SleepEx(INFINITE, TRUE);
+    SleepEx(3000, TRUE);
 #else
     getchar();
 #endif
@@ -45,7 +44,6 @@ int demo(int argc, char **argv)
     threadpool_destroy(pool);
 
 #else
-
 
     queue = queue_create(1024);
 
@@ -66,7 +64,7 @@ void show_time()
 #ifdef _WIN32
     SYSTEMTIME time = { 0 };
     GetLocalTime(&time);
-    printf("time = %02d:%02d:%02d:%03d\t", time.wHour, time.wMinute, time.wSecond, time.wMilliseconds);
+    printf("id=%ld time = %02d:%02d:%02d:%03d\t",GetCurrentThreadId(), time.wHour, time.wMinute, time.wSecond, time.wMilliseconds);
 
 #else
 
@@ -75,7 +73,7 @@ void show_time()
     time(&t);
     lt = localtime(&t);
 
-    printf("time = %02d:%02d:%02d:%03d\t", lt->tm_hour, lt->tm_min, lt->tm_sec, lt->tm_isdst);
+    printf("id=%d time = %02d:%02d:%02d:%03d\t",pthread_self(), lt->tm_hour, lt->tm_min, lt->tm_sec, lt->tm_isdst);
 
 #endif
 }
